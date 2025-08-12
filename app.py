@@ -1,170 +1,75 @@
 
 import streamlit as st
 import pandas as pd
-import numpy as np
 
-st.set_page_config(page_title="Rate Card Analyser", layout="wide")
-st.title("📊 Rate Card Revenue & Margin Uplift Analyser")
-
-# ---------- Data Loading ----------
 @st.cache_data
-def load_data(path: str = "rate_card_data.xlsx") -> pd.DataFrame:
-    df = pd.read_excel(path)
-    # Clean headers
-    df.columns = df.columns.astype(str).str.strip()
-    # Drop any pre-summed total rows by name pattern
-    if "Job Title" in df.columns:
-        df = df[~df["Job Title"].astype(str).str.contains("total", case=False, na=False)]
-    # Drop fully duplicated rows (exact duplicates)
-    df = df.drop_duplicates()
+def load_data():
+    df = pd.read_excel("rate_card_data.xls")
+    # Remove total rows if present
+    df = df[df['Branch'].notna()]
     return df
 
 df = load_data()
 
-# Identify revenue columns (those ending with '.2') and ensure consistent order
-revenue_cols = [c for c in df.columns if c.endswith(".2")]
-if not revenue_cols:
-    st.error("No revenue columns detected. Expected monthly revenue columns with a '.2' suffix (e.g., '2025-07-01 00:00:00.2').")
-    st.stop()
+st.title("📊 Rate Card Uplift Model")
 
-# Sort revenue columns by datetime value where possible
-def _col_to_dt(col: str):
-    try:
-        base = col.rsplit(".2", 1)[0]
-        return pd.to_datetime(base, errors="coerce")
-    except Exception:
-        return pd.NaT
-
-rev_dt = pd.Series({c: _col_to_dt(c) for c in revenue_cols})
-revenue_cols = [c for c in rev_dt.sort_values().index]
-
-# ---------- Enforce Uniqueness by Business Keys (prevents silent double counting) ----------
-key_cols = [c for c in ["Branch", "Capability", "Department / Team", "Job Title"] if c in df.columns]
-if key_cols:
-    # Build aggregation map: sum revenue columns; keep first for others
-    agg = {col: "first" for col in df.columns}
-    for col in revenue_cols:
-        agg[col] = "sum"
-    df = df.groupby(key_cols, as_index=False).agg(agg)
-
-# ---------- Sidebar Controls ----------
+# Sidebar filters
 st.sidebar.header("🔧 Uplift Parameters")
+branches = df["Branch"].unique()
+capabilities = df["Capability"].unique()
+teams = df["Department / Team"].unique()
+jobs = df["Job Title"].unique()
 
-def safe_unique(col):
-    return df[col].dropna().unique() if col in df.columns else []
+selected_branch = st.sidebar.selectbox("Select Branch", ["All"] + list(branches))
+selected_capability = st.sidebar.selectbox("Select Capability", ["All"] + list(capabilities))
+selected_team = st.sidebar.selectbox("Select Department / Team", ["All"] + list(teams))
+selected_job = st.sidebar.selectbox("Select Job Title", ["All"] + list(jobs))
 
-branches = safe_unique("Branch")
-capabilities = safe_unique("Capability")
-teams = safe_unique("Department / Team")
-jobs = safe_unique("Job Title")
+uplift_type = st.sidebar.radio("Uplift Type", ["Percentage (%)", "Absolute ($ per day)"])
+uplift_value = st.sidebar.number_input("Uplift Value", value=0.0, step=0.1)
 
-selected_branch = st.sidebar.multiselect("Branch", branches.tolist() if len(branches) else [], default=branches.tolist() if len(branches) else [])
-selected_capability = st.sidebar.multiselect("Capability", capabilities.tolist() if len(capabilities) else [], default=capabilities.tolist() if len(capabilities) else [])
-selected_team = st.sidebar.multiselect("Department / Team", teams.tolist() if len(teams) else [], default=teams.tolist() if len(teams) else [])
-selected_job = st.sidebar.multiselect("Job Title", jobs.tolist() if len(jobs) else [], default=jobs.tolist() if len(jobs) else [])
+# Filter data
+filtered_df = df.copy()
+if selected_branch != "All":
+    filtered_df = filtered_df[filtered_df["Branch"] == selected_branch]
+if selected_capability != "All":
+    filtered_df = filtered_df[filtered_df["Capability"] == selected_capability]
+if selected_team != "All":
+    filtered_df = filtered_df[filtered_df["Department / Team"] == selected_team]
+if selected_job != "All":
+    filtered_df = filtered_df[filtered_df["Job Title"] == selected_job]
 
-uplift_type = st.sidebar.radio("Choose uplift type", ["% Increase", "$ Increase"])
-if uplift_type == "% Increase":
-    uplift_value = st.sidebar.number_input("Rate Uplift (%)", min_value=0.0, max_value=100.0, value=5.0)
-else:
-    uplift_value = st.sidebar.number_input("Uplift ($ per day)", min_value=0.0, value=50.0)
+# Identify month columns
+month_cols = [col for col in filtered_df.columns if isinstance(col, pd.Timestamp) or "202" in str(col)]
 
-# Effective month selector (use revenue cols)
-month_label_map = {c: (_col_to_dt(c).strftime("%b %Y") if pd.notna(_col_to_dt(c)) else c) for c in revenue_cols}
-effective_month_display = st.sidebar.selectbox("Effective From Month", options=[month_label_map[c] for c in revenue_cols])
-reverse_month_map = {v: k for k, v in month_label_map.items()}
-effective_month = reverse_month_map[effective_month_display]
+# Calculate new revenue ignoring headcount (billable days already includes it)
+charge_rate_col = "Charge Rate Daily"
+chargeability_start = month_cols.index(month_cols[0]) + len(month_cols) // 3
+revenue_start = month_cols.index(month_cols[0]) + (len(month_cols) // 3) * 2
 
-# ---------- Filtering ----------
-mask = pd.Series(True, index=df.index)
-if len(branches):
-    mask &= df["Branch"].isin(selected_branch)
-if len(capabilities):
-    mask &= df["Capability"].isin(selected_capability)
-if len(teams):
-    mask &= df["Department / Team"].isin(selected_team)
-if len(jobs):
-    mask &= df["Job Title"].isin(selected_job)
-
-df_base = df.copy()
-df_affected = df.loc[mask].copy()
-df_unaffected = df.loc[~df.index.isin(df_affected.index)].copy()  # ensure no overlap
-
-# ---------- Apply Uplift (no headcount duplication) ----------
-start_idx = df.columns.get_loc(effective_month)
-rev_cols_from_effective = [c for c in revenue_cols if df.columns.get_loc(c) >= start_idx]
-
-rate_col = "Charge Rate Daily"
-cost_col = "Cost rate Daily"
-
-if uplift_type == "% Increase":
-    factor = 1 + uplift_value / 100.0
-    for col in rev_cols_from_effective:
-        df_affected[col] = df_affected[col] * factor
-else:
-    if rate_col not in df_affected.columns:
-        st.error(f"'{rate_col}' column not found. Cannot apply $ uplift.")
-        st.stop()
-    safe_rate = df_affected[rate_col].replace(0, np.nan)
-    ratio = (uplift_value / safe_rate).fillna(0.0)
-    for col in rev_cols_from_effective:
-        df_affected[col] = df_affected[col] * (1 + ratio)
-
-# Merge uplifted + unaffected
-df_uplifted = pd.concat([df_affected, df_unaffected], ignore_index=True)
-
-# ---------- Summaries ----------
-orig_total = df_base[rev_cols_from_effective].sum(numeric_only=True).sum()
-uplift_total = df_uplifted[rev_cols_from_effective].sum(numeric_only=True).sum()
-incremental = uplift_total - orig_total
-
-# Margin impact on affected roles
-if cost_col in df_affected.columns and rate_col in df_affected.columns:
-    if uplift_type == "% Increase":
-        new_rate = df_affected[rate_col] * (1 + uplift_value / 100.0)
+new_revenues = []
+for idx, row in filtered_df.iterrows():
+    charge_rate = row[charge_rate_col]
+    if uplift_type == "Percentage (%)":
+        charge_rate *= (1 + uplift_value / 100)
     else:
-        new_rate = df_affected[rate_col] + uplift_value
-    with np.errstate(divide='ignore', invalid='ignore'):
-        new_margin_pct = ((new_rate - df_affected[cost_col]) / new_rate) * 100.0
-    avg_margin = float(np.nanmean(new_margin_pct))
-else:
-    avg_margin = float("nan")
+        charge_rate += uplift_value
 
-# ---------- Diagnostics (optional toggle) ----------
-with st.expander("🧪 Diagnostics"):
-    st.write("Rows (base / affected / unaffected / merged):",
-             len(df_base), len(df_affected), len(df_unaffected), len(df_uplifted))
-    if key_cols:
-        dup_mask = df.duplicated(subset=key_cols, keep=False)
-        st.write("Potential duplicate business keys:", int(dup_mask.sum()))
-    st.write("Effective month:", effective_month_display)
-    st.write("Revenue columns considered:", [month_label_map[c] for c in rev_cols_from_effective])
+    monthly_revenue = []
+    for month in range(len(month_cols) // 3):
+        billable_days = row[month_cols[month]]
+        chargeability = row[month_cols[month + len(month_cols) // 3]]
+        revenue = charge_rate * billable_days * chargeability
+        monthly_revenue.append(revenue)
+    new_revenues.append(monthly_revenue)
 
-# ---------- Output ----------
-st.subheader("📈 Summary (from selected month onward)")
-c1, c2, c3 = st.columns(3)
-c1.metric("Original Revenue", f"${orig_total:,.0f}")
-c2.metric("Uplifted Revenue", f"${uplift_total:,.0f}", delta=f"${incremental:,.0f}")
-c3.metric("Avg. New Margin % (Affected Roles)", f"{avg_margin:.2f}%" if not np.isnan(avg_margin) else "N/A")
+# Create a DataFrame for results
+results_df = pd.DataFrame(new_revenues, columns=[f"Month {i+1}" for i in range(len(month_cols) // 3)])
+results_df["Total Revenue"] = results_df.sum(axis=1)
 
-# Monthly comparison (pretty month labels)
-monthly = pd.DataFrame({
-    "Month": [month_label_map[c] for c in rev_cols_from_effective],
-    "Original": [df_base[c].sum() for c in rev_cols_from_effective],
-    "Uplifted": [df_uplifted[c].sum() for c in rev_cols_from_effective],
-})
-monthly["Delta"] = monthly["Uplifted"] - monthly["Original"]
+# Show summary
+st.subheader("💡 Uplifted Revenue Summary")
+st.dataframe(results_df.style.format("${:,.0f}"))
 
-st.subheader("🗓️ Monthly Revenue Comparison")
-st.dataframe(
-    monthly.style.format({"Original": "$,.0f", "Uplifted": "$,.0f", "Delta": "$,.0f"}),
-    use_container_width=True
-)
-
-# Detailed breakdown by role (show all revenue cols, formatted)
-st.subheader("📋 Detailed Uplifted Revenue by Role")
-display_cols = [c for c in ["Branch", "Capability", "Department / Team", "Job Title"] if c in df_uplifted.columns] + revenue_cols
-st.dataframe(
-    df_uplifted[display_cols].style.format({col: "$,.0f" for col in revenue_cols}),
-    use_container_width=True
-)
+st.subheader("📄 Detailed Data")
+st.dataframe(filtered_df)
