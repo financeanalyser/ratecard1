@@ -15,13 +15,11 @@ def load_data(path: str = "rate_card_data.xlsx") -> pd.DataFrame:
     # Drop any pre-summed total rows by name pattern
     if "Job Title" in df.columns:
         df = df[~df["Job Title"].astype(str).str.contains("total", case=False, na=False)]
+    # Drop fully duplicated rows (exact duplicates)
+    df = df.drop_duplicates()
     return df
 
-try:
-    df = load_data()
-except Exception as e:
-    st.error(f"Unable to load 'rate_card_data.xlsx'. Please ensure it exists in the app directory. Error: {e}")
-    st.stop()
+df = load_data()
 
 # Identify revenue columns (those ending with '.2') and ensure consistent order
 revenue_cols = [c for c in df.columns if c.endswith(".2")]
@@ -29,22 +27,29 @@ if not revenue_cols:
     st.error("No revenue columns detected. Expected monthly revenue columns with a '.2' suffix (e.g., '2025-07-01 00:00:00.2').")
     st.stop()
 
-# Sort revenue columns by their datetime component if possible
+# Sort revenue columns by datetime value where possible
 def _col_to_dt(col: str):
-    # Strip the trailing ".2" and try to parse
     try:
         base = col.rsplit(".2", 1)[0]
-        return pd.to_datetime(base)
+        return pd.to_datetime(base, errors="coerce")
     except Exception:
         return pd.NaT
 
 rev_dt = pd.Series({c: _col_to_dt(c) for c in revenue_cols})
 revenue_cols = [c for c in rev_dt.sort_values().index]
 
+# ---------- Enforce Uniqueness by Business Keys (prevents silent double counting) ----------
+key_cols = [c for c in ["Branch", "Capability", "Department / Team", "Job Title"] if c in df.columns]
+if key_cols:
+    # Build aggregation map: sum revenue columns; keep first for others
+    agg = {col: "first" for col in df.columns}
+    for col in revenue_cols:
+        agg[col] = "sum"
+    df = df.groupby(key_cols, as_index=False).agg(agg)
+
 # ---------- Sidebar Controls ----------
 st.sidebar.header("🔧 Uplift Parameters")
 
-# Filters (robust to missing columns)
 def safe_unique(col):
     return df[col].dropna().unique() if col in df.columns else []
 
@@ -65,9 +70,8 @@ else:
     uplift_value = st.sidebar.number_input("Uplift ($ per day)", min_value=0.0, value=50.0)
 
 # Effective month selector (use revenue cols)
-month_label_map = {c: _col_to_dt(c).strftime("%b %Y") if pd.notna(_col_to_dt(c)) else c for c in revenue_cols}
+month_label_map = {c: (_col_to_dt(c).strftime("%b %Y") if pd.notna(_col_to_dt(c)) else c) for c in revenue_cols}
 effective_month_display = st.sidebar.selectbox("Effective From Month", options=[month_label_map[c] for c in revenue_cols])
-# Map back to original column key
 reverse_month_map = {v: k for k, v in month_label_map.items()}
 effective_month = reverse_month_map[effective_month_display]
 
@@ -86,7 +90,7 @@ df_base = df.copy()
 df_affected = df.loc[mask].copy()
 df_unaffected = df.loc[~df.index.isin(df_affected.index)].copy()  # ensure no overlap
 
-# ---------- Apply Uplift Correctly (no double counting headcount) ----------
+# ---------- Apply Uplift (no headcount duplication) ----------
 start_idx = df.columns.get_loc(effective_month)
 rev_cols_from_effective = [c for c in revenue_cols if df.columns.get_loc(c) >= start_idx]
 
@@ -98,11 +102,9 @@ if uplift_type == "% Increase":
     for col in rev_cols_from_effective:
         df_affected[col] = df_affected[col] * factor
 else:
-    # For fixed $/day uplift, apply proportional revenue uplift based on daily rate per row
     if rate_col not in df_affected.columns:
         st.error(f"'{rate_col}' column not found. Cannot apply $ uplift.")
         st.stop()
-    # Avoid division by zero
     safe_rate = df_affected[rate_col].replace(0, np.nan)
     ratio = (uplift_value / safe_rate).fillna(0.0)
     for col in rev_cols_from_effective:
@@ -116,7 +118,7 @@ orig_total = df_base[rev_cols_from_effective].sum(numeric_only=True).sum()
 uplift_total = df_uplifted[rev_cols_from_effective].sum(numeric_only=True).sum()
 incremental = uplift_total - orig_total
 
-# Margin impact on affected roles (using new rate only, independent of month)
+# Margin impact on affected roles
 if cost_col in df_affected.columns and rate_col in df_affected.columns:
     if uplift_type == "% Increase":
         new_rate = df_affected[rate_col] * (1 + uplift_value / 100.0)
@@ -127,6 +129,16 @@ if cost_col in df_affected.columns and rate_col in df_affected.columns:
     avg_margin = float(np.nanmean(new_margin_pct))
 else:
     avg_margin = float("nan")
+
+# ---------- Diagnostics (optional toggle) ----------
+with st.expander("🧪 Diagnostics"):
+    st.write("Rows (base / affected / unaffected / merged):",
+             len(df_base), len(df_affected), len(df_unaffected), len(df_uplifted))
+    if key_cols:
+        dup_mask = df.duplicated(subset=key_cols, keep=False)
+        st.write("Potential duplicate business keys:", int(dup_mask.sum()))
+    st.write("Effective month:", effective_month_display)
+    st.write("Revenue columns considered:", [month_label_map[c] for c in rev_cols_from_effective])
 
 # ---------- Output ----------
 st.subheader("📈 Summary (from selected month onward)")
